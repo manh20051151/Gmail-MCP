@@ -1,0 +1,339 @@
+/**
+ * gmail_tool.js  –  Antigravity + Gmail MCP
+ * Chạy: node gmail_tool.js
+ */
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+const { google } = require('googleapis');
+const os = require('os');
+
+// ═══════════════════════════════════════════════════════════════════
+// ⚙️  CẤU HÌNH – Chỉnh tại đây để thay đổi hành vi tìm kiếm
+// ═══════════════════════════════════════════════════════════════════
+const CONFIG = {
+    /** Số email tối đa trả về (Gmail API max 500) */
+    maxResults: 10,
+
+    /**
+     * Query Gmail (cú pháp giống ô tìm kiếm Gmail)
+     * Ví dụ:
+     *   "in:sent subject:ứng tuyển"
+     *   "in:sent subject:CV has:attachment"
+     *   "in:sent to:hr@company.com subject:ứng tuyển"
+     *   "in:sent subject:ứng tuyển after:2024/01/01 before:2025/01/01"
+     */
+    query: "in:sent subject:ứng tuyển OR subject:xin việc OR subject:application OR subject:CV",
+};
+
+// ── Màu terminal (ANSI) ──────────────────────────────────────────────────────
+const C = {
+    reset: '\x1b[0m',
+    bold: '\x1b[1m',
+    dim: '\x1b[2m',
+    cyan: '\x1b[36m',
+    green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    red: '\x1b[31m',
+    blue: '\x1b[34m',
+    magenta: '\x1b[35m',
+    white: '\x1b[97m',
+    bgBlue: '\x1b[44m',
+    bgGreen: '\x1b[42m',
+};
+
+const GMAIL_MCP_DIR = path.join(os.homedir(), '.gmail-mcp');
+const CREDENTIALS_PATH = path.join(GMAIL_MCP_DIR, 'credentials.json');
+const OAUTH_KEYS_PATH = path.join(GMAIL_MCP_DIR, 'gcp-oauth.keys.json');
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function prompt(question) {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise(r => rl.question(question, ans => { rl.close(); r(ans.trim()); }));
+}
+
+function extractBody(payload) {
+    if (payload.body?.data)
+        return Buffer.from(payload.body.data, 'base64').toString('utf8');
+    if (payload.parts) {
+        for (const p of payload.parts)
+            if (p.mimeType === 'text/plain' && p.body?.data)
+                return Buffer.from(p.body.data, 'base64').toString('utf8');
+        for (const p of payload.parts) {
+            const r = extractBody(p);
+            if (r) return r;
+        }
+    }
+    return '';
+}
+
+/** Lấy 10 từ đầu từ body email */
+function getFirst10Words(text) {
+    return text.trim().replace(/\s+/g, ' ').split(' ').slice(0, 10).join(' ');
+}
+
+/** Format ngày giờ sang giờ Việt Nam */
+function formatDate(dateHeader) {
+    return new Date(dateHeader).toLocaleString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+}
+
+function divider(char = '─', len = 58) {
+    return C.dim + char.repeat(len) + C.reset;
+}
+
+function step(n, label) {
+    console.log(`\n${C.bgBlue}${C.white}${C.bold}  BƯỚC ${n}  ${C.reset} ${C.bold}${C.cyan}${label}${C.reset}`);
+    console.log(divider());
+}
+
+function log(icon, label, value) {
+    const pad = ' '.repeat(Math.max(0, 12 - label.length));
+    console.log(`  ${icon} ${C.bold}${label}${C.reset}${pad}: ${C.white}${value}${C.reset}`);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+    // ── Banner ──────────────────────────────────────────────────────────────
+    console.log('\n' + C.bold + C.cyan +
+        '╔══════════════════════════════════════════════════════════╗\n' +
+        '║         ANTIGRAVITY  +  GMAIL MCP  TOOL                  ║\n' +
+        '║         Tìm email ứng tuyển – Xem chi tiết – Reply       ║\n' +
+        '╚══════════════════════════════════════════════════════════╝' +
+        C.reset + '\n');
+
+    // ── Khởi tạo Gmail API ──────────────────────────────────────────────────
+    const oauthKeys = JSON.parse(fs.readFileSync(OAUTH_KEYS_PATH, 'utf8'));
+    const keyData = oauthKeys.installed || oauthKeys.web;
+    const savedCreds = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+
+    const oauth2Client = new google.auth.OAuth2(
+        keyData.client_id,
+        keyData.client_secret,
+        keyData.redirect_uris?.[0] || 'http://localhost:3000/oauth2callback'
+    );
+    oauth2Client.setCredentials(savedCreds);
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    console.log(`  ${C.green}✔ Đã kết nối Gmail API${C.reset}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // BƯỚC 1 – Nhập tiêu đề & Tìm email
+    // ══════════════════════════════════════════════════════════════════════════
+    step(1, 'Tìm email ứng tuyển (mcp_gmail_search_emails)');
+
+    // Nhập tiêu đề từ terminal
+    const inputTitle = await prompt(`  ${C.yellow}🔍 Nhập tiêu đề (subject) cần tìm${C.reset} [Enter để dùng mặc định]: `);
+    const searchQuery = inputTitle
+        ? `in:sent subject:${inputTitle}`
+        : CONFIG.query;
+
+    console.log(`\n  ${C.yellow}▶ Query     ${C.reset}: ${searchQuery}`);
+    console.log(`  ${C.yellow}▶ maxResults${C.reset}: ${CONFIG.maxResults}\n`);
+
+    const searchRes = await gmail.users.messages.list({
+        userId: 'me',
+        q: searchQuery,
+        maxResults: CONFIG.maxResults,
+    });
+
+    if (!searchRes.data.messages?.length) {
+        console.log(`  ${C.red}⚠  Không tìm thấy email nào khớp.${C.reset}`);
+        process.exit(0);
+    }
+    console.log(`  ${C.green}✔ Tìm thấy ${searchRes.data.messages.length} email${C.reset}`);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // BƯỚC 2 – Đọc chi tiết từng email
+    // ══════════════════════════════════════════════════════════════════════════
+    step(2, 'Đọc chi tiết email (mcp_gmail_read_email)');
+
+    const emails = [];
+    for (const m of searchRes.data.messages) {
+        process.stdout.write(`  ${C.dim}→ Đang đọc ID ${m.id}...${C.reset}\r`);
+        const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'full' });
+        const hdrs = msg.data.payload.headers;
+        const get = name => hdrs.find(h => h.name === name)?.value || '';
+        const body = extractBody(msg.data.payload);
+
+        emails.push({
+            id: m.id,
+            threadId: msg.data.threadId,
+            subject: get('Subject') || '(no subject)',
+            to: get('To'),
+            from: get('From'),
+            date: get('Date'),
+            msgId: get('Message-ID'),
+            first10: getFirst10Words(body),
+            body,
+        });
+    }
+
+    // Xoá dòng "đang đọc"
+    process.stdout.write(' '.repeat(60) + '\r');
+
+    emails.forEach((e, i) => {
+        console.log(`\n  ${C.bold}${C.magenta}[${i + 1}]${C.reset} ${C.bold}${e.subject}${C.reset}`);
+        log('📅', 'Ngày gửi', formatDate(e.date));
+        log('📧', 'Gửi đến', e.to);
+        log('💬', '10 từ đầu', `"${e.first10}"`);
+    });
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // BƯỚC 3 – Chọn email để reply
+    // ══════════════════════════════════════════════════════════════════════════
+    step(3, 'Tạo nháp Reply (mcp_gmail_draft_email)');
+
+    const choice = await prompt(`\n  📌 Chọn số email muốn gửi (1-${emails.length}): `);
+    const idx = parseInt(choice, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= emails.length) {
+        console.log(`\n  ${C.red}❌ Lựa chọn không hợp lệ!${C.reset}`);
+        process.exit(1);
+    }
+
+    const sel = emails[idx];
+    console.log(`\n  ${C.green}✔ Đã chọn: "${sel.subject}"${C.reset}`);
+    console.log(divider());
+
+    // ── Tự sinh nội dung reply từ thông tin email ──────────────────────────
+    const replyBody =
+        `Email ứng tuyển đã gửi vào lúc: ${formatDate(sel.date)}
+10 từ đầu tiên: "${sel.first10}"`;
+
+    console.log(`\n  ${C.cyan}📝 Nội dung reply (tự động):${C.reset}\n`);
+    replyBody.split('\n').forEach(l => console.log(`  ${C.dim}│${C.reset} ${l}`));
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // BƯỚC 4 – Chọn ảnh từ thư mục để đính kèm
+    // ══════════════════════════════════════════════════════════════════════════
+    step(4, 'Chọn ảnh đính kèm từ thư mục');
+
+    const imgDir = await prompt(`\n  📁 Nhập đường dẫn thư mục chứa ảnh [Enter để dùng thư mục hiện tại]: `);
+    const targetDir = imgDir || process.cwd();
+
+    // Lọc file ảnh trong thư mục
+    const IMG_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
+    let imgFiles = [];
+    try {
+        imgFiles = fs.readdirSync(targetDir)
+            .filter(f => IMG_EXTS.includes(path.extname(f).toLowerCase()))
+            .map(f => ({ name: f, fullPath: path.join(targetDir, f) }));
+    } catch (e) {
+        console.log(`  ${C.red}❌ Không thể đọc thư mục: ${e.message}${C.reset}`);
+    }
+
+    let attachPath = null;
+    let attachName = null;
+
+    if (imgFiles.length === 0) {
+        console.log(`  ${C.yellow}⚠  Không tìm thấy file ảnh nào trong thư mục. Nháp sẽ không có đính kèm.${C.reset}`);
+    } else {
+        console.log(`\n  ${C.green}✔ Tìm thấy ${imgFiles.length} file ảnh:${C.reset}\n`);
+        imgFiles.forEach((f, i) => {
+            const size = (fs.statSync(f.fullPath).size / 1024).toFixed(1);
+            console.log(`  ${C.magenta}[${i + 1}]${C.reset} ${f.name} ${C.dim}(${size} KB)${C.reset}`);
+        });
+
+        const imgChoice = await prompt(`\n  🖼  Chọn số ảnh để đính kèm (1-${imgFiles.length}) [Enter để bỏ qua]: `);
+        const imgIdx = parseInt(imgChoice, 10) - 1;
+
+        if (!isNaN(imgIdx) && imgIdx >= 0 && imgIdx < imgFiles.length) {
+            attachPath = imgFiles[imgIdx].fullPath;
+            attachName = imgFiles[imgIdx].name;
+            console.log(`\n  ${C.green}✔ Đã chọn ảnh: ${attachName}${C.reset}`);
+        } else if (imgChoice !== '') {
+            console.log(`  ${C.yellow}⚠  Bỏ qua đính kèm ảnh.${C.reset}`);
+        }
+    }
+
+    // ── Tạo MIME message (multipart/mixed nếu có ảnh, text/plain nếu không) ─
+    const replySubject = sel.subject.startsWith('Re:') ? sel.subject : `Re: ${sel.subject}`;
+    const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+    let rawString;
+    if (attachPath) {
+        const imgData = fs.readFileSync(attachPath);
+        const imgB64 = imgData.toString('base64');
+        const ext = path.extname(attachName).slice(1).toLowerCase();
+        const mimeType = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg'
+            : ext === 'png' ? 'image/png'
+                : ext === 'gif' ? 'image/gif'
+                    : ext === 'webp' ? 'image/webp'
+                        : 'application/octet-stream';
+
+        rawString = [
+            `From: ${sel.from}`,
+            `To: ${sel.to}`,
+            `Subject: ${replySubject}`,
+            `In-Reply-To: ${sel.msgId}`,
+            `References: ${sel.msgId}`,
+            `MIME-Version: 1.0`,
+            `Content-Type: multipart/mixed; boundary="${boundary}"`,
+            ``,
+            `--${boundary}`,
+            `Content-Type: text/plain; charset="UTF-8"`,
+            ``,
+            replyBody,
+            ``,
+            `--${boundary}`,
+            `Content-Type: ${mimeType}; name="${attachName}"`,
+            `Content-Disposition: attachment; filename="${attachName}"`,
+            `Content-Transfer-Encoding: base64`,
+            ``,
+            imgB64.match(/.{1,76}/g).join('\r\n'),
+            ``,
+            `--${boundary}--`,
+        ].join('\r\n');
+    } else {
+        rawString = [
+            `From: ${sel.from}`,
+            `To: ${sel.to}`,
+            `Subject: ${replySubject}`,
+            `In-Reply-To: ${sel.msgId}`,
+            `References: ${sel.msgId}`,
+            `Content-Type: text/plain; charset=utf-8`,
+            ``,
+            replyBody,
+        ].join('\r\n');
+    }
+
+    const raw = Buffer.from(rawString)
+        .toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    console.log(`\n  ${C.dim}� Đang gửi email...${C.reset}`);
+
+    try {
+        const sent = await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: { raw, threadId: sel.threadId },
+        });
+
+        console.log('\n' + C.bold + C.green +
+            '╔══════════════════════════════════════════════════════════╗\n' +
+            '║            ĐÃ GỬI EMAIL THÀNH CÔNG!                      ║\n' +
+            '╚══════════════════════════════════════════════════════════╝' +
+            C.reset);
+
+        log('🆔', 'Message ID', sent.data.id);
+        log('📧', 'Gửi đến', sel.to);
+        log('📋', 'Subject', replySubject);
+        log('📅', 'Ngày gốc', formatDate(sel.date));
+        log('💬', '10 từ đầu', `"${sel.first10}"`);
+        if (attachName) log('🖼 ', 'Ảnh đính kèm', attachName);
+
+        console.log(`\n  ${C.cyan}👉 Email đã xuất hiện trong Gmail > Đã gửi (Sent).${C.reset}\n`);
+    } catch (err) {
+        console.error(`\n  ${C.red}❌ Lỗi khi gửi email: ${err.message}${C.reset}`);
+        if (err.response) console.error(JSON.stringify(err.response.data, null, 2));
+    }
+}
+
+main().catch(err => {
+    console.error(`\n${C.red}❌ Lỗi: ${err.message}${C.reset}`);
+    process.exit(1);
+});
+
+
